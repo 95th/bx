@@ -1,4 +1,5 @@
-use bx::*;
+use bx::de::{Decode, Decoder, Dict, Visitor};
+use bx::{Error, Result};
 
 fn main() {
     let f: Foo = bx::parse(b"d1:b3:abc1:ai12ee").unwrap();
