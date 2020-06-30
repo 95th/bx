@@ -1,4 +1,7 @@
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::convert::TryInto;
+use std::hash::Hash;
+use std::marker::PhantomData;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -59,6 +62,7 @@ impl<'buf> Decoder<'buf> {
         }
 
         let out = visitor.visit_list(ListAccess { decoder: self })?;
+
         if self.next_char()? == b'e' {
             Ok(out)
         } else {
@@ -239,39 +243,41 @@ impl<'buf> Decode<'buf> for &'buf str {
     }
 }
 
+////////////////// Impls //////////////////
+
 macro_rules! tuple_impl {
-    ($($t:ident),+ ) => {
-        impl<'buf, $( $t ),+> Decode<'buf> for ($( $t ),+)
+    ($($t:ident),* ) => {
+        impl<'buf, $( $t ),*> Decode<'buf> for ($( $t ),*)
         where
-            $( $t: Decode<'buf> ),+
+            $( $t: Decode<'buf> ),*
         {
             fn decode(decoder: &mut Decoder<'buf>) -> Result<Self> {
-                use std::marker::PhantomData;
+                struct TheVisitor<$( $t ),*>(PhantomData<($( $t ),*)>);
 
-                struct TupleVisitor<$( $t ),+>(PhantomData<($( $t ),+)>);
-
-                impl<'buf, $( $t ),+> Visitor<'buf> for TupleVisitor<$( $t ),+>
+                impl<'buf, $( $t ),*> Visitor<'buf> for TheVisitor<$( $t ),*>
                 where
-                    $( $t: Decode<'buf> ),+
+                    $( $t: Decode<'buf> ),*
                 {
-                    type Value = ($( $t ),+);
+                    type Value = ($( $t ),*);
 
+                    #[allow(unused)]
                     fn visit_list(self, mut list: ListAccess<'_, 'buf>) -> Result<Self::Value> {
                         Ok(($(
                             match list.next_element::<$t>()? {
                                 Some(t) => t,
                                 None => return Err(Error::Eof),
                             }
-                        ),+))
+                        ),*))
                     }
                 }
 
-                decoder.decode_list(TupleVisitor(PhantomData))
+                decoder.decode_list(TheVisitor(PhantomData))
             }
         }
     }
 }
 
+tuple_impl!();
 tuple_impl!(T0, T1);
 tuple_impl!(T0, T1, T2);
 tuple_impl!(T0, T1, T2, T3);
@@ -295,11 +301,9 @@ macro_rules! array_impl {
             T: Decode<'buf>,
         {
             fn decode(decoder: &mut Decoder<'buf>) -> Result<Self> {
-                use std::marker::PhantomData;
+                struct TheVisitor<T>(PhantomData<T>);
 
-                struct ArrayVisitor<T>(PhantomData<T>);
-
-                impl<'buf, T> Visitor<'buf> for ArrayVisitor<T>
+                impl<'buf, T> Visitor<'buf> for TheVisitor<T>
                 where
                     T: Decode<'buf>,
                 {
@@ -315,7 +319,7 @@ macro_rules! array_impl {
                     }
                 }
 
-                decoder.decode_list(ArrayVisitor(PhantomData))
+                decoder.decode_list(TheVisitor(PhantomData))
             }
         }
     }
@@ -353,3 +357,71 @@ array_impl!(29 => [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17,
 array_impl!(30 => [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]);
 array_impl!(31 => [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]);
 array_impl!(32 => [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]);
+
+macro_rules! list_impl {
+    ($ty:ident, $fn:ident, Decode<'buf> $(+ $bounds:ident )* ) => {
+        impl<'buf, T> Decode<'buf> for $ty<T>
+        where
+            T: Decode<'buf> $( + $bounds )*,
+        {
+            fn decode(decoder: &mut Decoder<'buf>) -> Result<Self> {
+                struct TheVisitor<T>(PhantomData<T>);
+
+                impl<'buf, T> Visitor<'buf> for TheVisitor<T>
+                where
+                    T: Decode<'buf> $( + $bounds )*,
+                {
+                    type Value = $ty<T>;
+
+                    fn visit_list(self, mut list: ListAccess<'_, 'buf>) -> Result<Self::Value> {
+                        let mut out = $ty::new();
+                        while let Some(t) = list.next_element()? {
+                            out.$fn(t);
+                        }
+                        Ok(out)
+                    }
+                }
+
+                decoder.decode_list(TheVisitor(PhantomData))
+            }
+        }
+    }
+}
+
+list_impl!(Vec, push, Decode<'buf>);
+list_impl!(VecDeque, push_back, Decode<'buf>);
+list_impl!(HashSet, insert, Decode<'buf> + Hash + Eq);
+list_impl!(BTreeSet, insert, Decode<'buf> + Ord);
+
+macro_rules! map_impl {
+    ($ty:ident) => {
+        impl<'buf, T> Decode<'buf> for $ty<&'buf [u8], T>
+        where
+            T: Decode<'buf>,
+        {
+            fn decode(decoder: &mut Decoder<'buf>) -> Result<Self> {
+                struct TheVisitor<T>(PhantomData<T>);
+
+                impl<'buf, T> Visitor<'buf> for TheVisitor<T>
+                where
+                    T: Decode<'buf>,
+                {
+                    type Value = $ty<&'buf [u8], T>;
+
+                    fn visit_dict(self, mut dict: DictAccess<'_, 'buf>) -> Result<Self::Value> {
+                        let mut out = $ty::new();
+                        while let Some((k, v)) = dict.next_entry()? {
+                            out.insert(k, v);
+                        }
+                        Ok(out)
+                    }
+                }
+
+                decoder.decode_list(TheVisitor(PhantomData))
+            }
+        }
+    };
+}
+
+map_impl!(HashMap);
+map_impl!(BTreeMap);
