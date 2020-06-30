@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::convert::TryInto;
+use std::fmt;
 use std::hash::Hash;
 use std::marker::PhantomData;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Debug)]
 pub enum Error {
     Eof,
     Type { reason: &'static str },
@@ -15,35 +15,77 @@ pub enum Error {
     Overflow { pos: usize },
 }
 
+impl std::error::Error for Error {}
+
+impl fmt::Debug for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::Eof => f.write_str("Unexpected end of file"),
+            Error::Type { reason } => write!(f, "Type Mismatch: {}", reason),
+            Error::Length { expected, actual } => write!(
+                f,
+                "Length Mismatch: Expected: {}, Actual: {}",
+                expected, actual
+            ),
+            Error::Parse { reason, pos } => write!(f, "Parse Error at {}: {}", pos, reason),
+            Error::Unexpected { pos } => write!(f, "Unexpected character at {}", pos),
+            Error::Overflow { pos } => write!(f, "Numeric overflow occurred at {}", pos),
+        }
+    }
+}
+
 pub trait Decode<'buf>: Sized {
-    fn decode(decoder: &mut Decoder<'buf>) -> Result<Self>;
+    fn decode<D>(decoder: D) -> Result<Self>
+    where
+        D: Decoder<'buf>;
 }
 
 pub fn parse<'buf, T>(buf: &'buf [u8]) -> Result<T>
 where
     T: Decode<'buf>,
 {
-    let decoder = &mut Decoder { buf, pos: 0 };
+    let decoder = &mut BenDecoder { buf, pos: 0 };
     T::decode(decoder)
 }
 
-pub struct Decoder<'buf> {
+pub trait Decoder<'buf> {
+    fn decode_dict<V>(self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'buf>;
+
+    fn decode_list<V>(self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'buf>;
+
+    fn decode_int(self) -> Result<i64>;
+
+    fn decode_bytes(self) -> Result<&'buf [u8]>;
+}
+
+struct BenDecoder<'buf> {
     buf: &'buf [u8],
     pos: usize,
 }
 
-impl<'buf> Decoder<'buf> {
-    pub fn decode_dict<V>(&mut self, visitor: V) -> Result<V::Value>
+impl<'buf> Decoder<'buf> for &mut BenDecoder<'buf> {
+    fn decode_dict<V>(self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'buf>,
     {
         if self.next_char()? != b'd' {
-            return Err(Error::Type {
+            return Err(Error::Parse {
                 reason: "Expected Dict",
+                pos: self.pos,
             });
         }
 
-        let out = visitor.visit_dict(DictAccess { decoder: self })?;
+        let out = visitor.visit_dict(&mut *self)?;
         if self.next_char()? == b'e' {
             Ok(out)
         } else {
@@ -51,17 +93,18 @@ impl<'buf> Decoder<'buf> {
         }
     }
 
-    pub fn decode_list<V>(&mut self, visitor: V) -> Result<V::Value>
+    fn decode_list<V>(self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'buf>,
     {
         if self.next_char()? != b'l' {
-            return Err(Error::Type {
+            return Err(Error::Parse {
                 reason: "Expected List",
+                pos: self.pos,
             });
         }
 
-        let out = visitor.visit_list(ListAccess { decoder: self })?;
+        let out = visitor.visit_list(&mut *self)?;
 
         if self.next_char()? == b'e' {
             Ok(out)
@@ -70,22 +113,24 @@ impl<'buf> Decoder<'buf> {
         }
     }
 
-    pub fn decode_int(&mut self) -> Result<i64> {
+    fn decode_int(self) -> Result<i64> {
         if self.next_char()? != b'i' {
-            return Err(Error::Type {
+            return Err(Error::Parse {
                 reason: "Expected integer",
+                pos: self.pos,
             });
         }
 
         self.parse_int_until(b'e')
     }
 
-    pub fn decode_bytes(&mut self) -> Result<&'buf [u8]> {
+    fn decode_bytes(self) -> Result<&'buf [u8]> {
         if let b'0'..=b'9' = self.peek_char()? {
             // Ok
         } else {
-            return Err(Error::Type {
+            return Err(Error::Parse {
                 reason: "Expected byte string",
+                pos: self.pos,
             });
         }
 
@@ -108,7 +153,7 @@ impl<'buf> Decoder<'buf> {
     }
 }
 
-impl<'buf> Decoder<'buf> {
+impl<'buf> BenDecoder<'buf> {
     fn peek_char(&mut self) -> Result<u8> {
         self.buf.get(self.pos).copied().ok_or_else(|| Error::Eof)
     }
@@ -160,13 +205,19 @@ impl<'buf> Decoder<'buf> {
 pub trait Visitor<'buf>: Sized {
     type Value;
 
-    fn visit_dict(self, _dict: DictAccess<'_, 'buf>) -> Result<Self::Value> {
+    fn visit_dict<A>(self, _v: A) -> Result<Self::Value>
+    where
+        A: Dict<'buf>,
+    {
         Err(Error::Type {
             reason: "Dict not expected",
         })
     }
 
-    fn visit_list(self, _list: ListAccess<'_, 'buf>) -> Result<Self::Value> {
+    fn visit_list<A>(self, _v: A) -> Result<Self::Value>
+    where
+        A: List<'buf>,
+    {
         Err(Error::Type {
             reason: "List not expected",
         })
@@ -185,57 +236,70 @@ pub trait Visitor<'buf>: Sized {
     }
 }
 
-pub struct DictAccess<'a, 'buf> {
-    decoder: &'a mut Decoder<'buf>,
+pub trait Dict<'buf> {
+    fn next_entry<T>(&mut self) -> Result<Option<(&'buf [u8], T)>>
+    where
+        T: Decode<'buf>;
 }
 
-impl<'a, 'buf> DictAccess<'a, 'buf> {
-    pub fn next_entry<T>(&mut self) -> Result<Option<(&'buf [u8], T)>>
+pub trait List<'buf> {
+    fn next_element<T>(&mut self) -> Result<Option<T>>
+    where
+        T: Decode<'buf>;
+}
+
+impl<'buf> Dict<'buf> for &mut BenDecoder<'buf> {
+    fn next_entry<T>(&mut self) -> Result<Option<(&'buf [u8], T)>>
     where
         T: Decode<'buf>,
     {
-        if self.decoder.peek_char()? == b'e' {
+        if self.peek_char()? == b'e' {
             return Ok(None);
         }
 
-        let key = self.decoder.decode_bytes()?;
-        let value = T::decode(self.decoder)?;
+        let key = self.decode_bytes()?;
+        let value = T::decode(&mut **self)?;
         Ok(Some((key, value)))
     }
 }
 
-pub struct ListAccess<'a, 'buf> {
-    decoder: &'a mut Decoder<'buf>,
-}
-
-impl<'a, 'buf> ListAccess<'a, 'buf> {
-    pub fn next_element<T>(&mut self) -> Result<Option<T>>
+impl<'a, 'buf> List<'buf> for &mut BenDecoder<'buf> {
+    fn next_element<T>(&mut self) -> Result<Option<T>>
     where
         T: Decode<'buf>,
     {
-        if self.decoder.peek_char()? == b'e' {
+        if self.peek_char()? == b'e' {
             return Ok(None);
         }
 
-        let v = T::decode(self.decoder)?;
+        let v = T::decode(&mut **self)?;
         Ok(Some(v))
     }
 }
 
 impl<'buf> Decode<'buf> for &'buf [u8] {
-    fn decode(decoder: &mut Decoder<'buf>) -> Result<Self> {
+    fn decode<D>(decoder: D) -> Result<Self>
+    where
+        D: Decoder<'buf>,
+    {
         decoder.decode_bytes()
     }
 }
 
 impl<'buf> Decode<'buf> for i64 {
-    fn decode(decoder: &mut Decoder<'buf>) -> Result<Self> {
+    fn decode<D>(decoder: D) -> Result<Self>
+    where
+        D: Decoder<'buf>,
+    {
         decoder.decode_int()
     }
 }
 
 impl<'buf> Decode<'buf> for &'buf str {
-    fn decode(decoder: &mut Decoder<'buf>) -> Result<Self> {
+    fn decode<D>(decoder: D) -> Result<Self>
+    where
+        D: Decoder<'buf>,
+    {
         let bytes = decoder.decode_bytes()?;
         std::str::from_utf8(bytes).map_err(|_| Error::Type {
             reason: "Not a valid UTF-8 string",
@@ -251,7 +315,10 @@ macro_rules! tuple_impl {
         where
             $( $t: Decode<'buf> ),*
         {
-            fn decode(decoder: &mut Decoder<'buf>) -> Result<Self> {
+            fn decode<D>(decoder: D) -> Result<Self>
+            where
+                D: Decoder<'buf>,
+            {
                 struct TheVisitor<$( $t ),*>(PhantomData<($( $t ),*)>);
 
                 impl<'buf, $( $t ),*> Visitor<'buf> for TheVisitor<$( $t ),*>
@@ -261,7 +328,10 @@ macro_rules! tuple_impl {
                     type Value = ($( $t ),*);
 
                     #[allow(unused)]
-                    fn visit_list(self, mut list: ListAccess<'_, 'buf>) -> Result<Self::Value> {
+                    fn visit_list<A>(self, mut list: A) -> Result<Self::Value>
+                    where
+                        A: List<'buf>
+                    {
                         Ok(($(
                             match list.next_element::<$t>()? {
                                 Some(t) => t,
@@ -300,7 +370,10 @@ macro_rules! array_impl {
         where
             T: Decode<'buf>,
         {
-            fn decode(decoder: &mut Decoder<'buf>) -> Result<Self> {
+            fn decode<D>(decoder: D) -> Result<Self>
+            where
+                D: Decoder<'buf>,
+            {
                 struct TheVisitor<T>(PhantomData<T>);
 
                 impl<'buf, T> Visitor<'buf> for TheVisitor<T>
@@ -309,7 +382,10 @@ macro_rules! array_impl {
                 {
                     type Value = [T; $len];
 
-                    fn visit_list(self, mut list: ListAccess<'_, 'buf>) -> Result<Self::Value> {
+                    fn visit_list<A>(self, mut list: A) -> Result<Self::Value>
+                    where
+                        A: List<'buf>
+                    {
                         Ok([$(
                             match list.next_element()? {
                                 Some(t) => t,
@@ -364,7 +440,10 @@ macro_rules! list_impl {
         where
             T: Decode<'buf> $( + $bounds )*,
         {
-            fn decode(decoder: &mut Decoder<'buf>) -> Result<Self> {
+            fn decode<D>(decoder: D) -> Result<Self>
+            where
+                D: Decoder<'buf>,
+            {
                 struct TheVisitor<T>(PhantomData<T>);
 
                 impl<'buf, T> Visitor<'buf> for TheVisitor<T>
@@ -373,7 +452,10 @@ macro_rules! list_impl {
                 {
                     type Value = $ty<T>;
 
-                    fn visit_list(self, mut list: ListAccess<'_, 'buf>) -> Result<Self::Value> {
+                    fn visit_list<A>(self, mut list: A) -> Result<Self::Value>
+                    where
+                        A: List<'buf>
+                    {
                         let mut out = $ty::new();
                         while let Some(t) = list.next_element()? {
                             out.$fn(t);
@@ -399,7 +481,10 @@ macro_rules! map_impl {
         where
             T: Decode<'buf>,
         {
-            fn decode(decoder: &mut Decoder<'buf>) -> Result<Self> {
+            fn decode<D>(decoder: D) -> Result<Self>
+            where
+                D: Decoder<'buf>,
+            {
                 struct TheVisitor<T>(PhantomData<T>);
 
                 impl<'buf, T> Visitor<'buf> for TheVisitor<T>
@@ -408,7 +493,10 @@ macro_rules! map_impl {
                 {
                     type Value = $ty<&'buf [u8], T>;
 
-                    fn visit_dict(self, mut dict: DictAccess<'_, 'buf>) -> Result<Self::Value> {
+                    fn visit_dict<A>(self, mut dict: A) -> Result<Self::Value>
+                    where
+                        A: Dict<'buf>,
+                    {
                         let mut out = $ty::new();
                         while let Some((k, v)) = dict.next_entry()? {
                             out.insert(k, v);

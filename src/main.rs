@@ -1,29 +1,33 @@
 use bx::*;
 
 fn main() {
-    let f: Foo = bx::parse(b"d1:ale1:bi12ee").unwrap();
+    let f: Foo = bx::parse(b"d1:b3:abc1:ai12ee").unwrap();
     println!("{:?}", f);
 }
 
 #[derive(Debug)]
-struct Foo {
-    a: (),
+struct Foo<'a> {
+    id: &'a [u8],
     b: i64,
 }
 
-impl<'a> Decode<'a> for Foo {
-    fn decode(decoder: &mut Decoder<'a>) -> Result<Self> {
+impl<'a> Decode<'a> for Foo<'a> {
+    fn decode<D>(decoder: D) -> Result<Self>
+    where
+        D: Decoder<'a>,
+    {
         struct FooVisitor;
 
         impl<'buf> Visitor<'buf> for FooVisitor {
-            type Value = Foo;
+            type Value = Foo<'buf>;
 
-            fn visit_dict(self, mut dict: DictAccess<'_, 'buf>) -> Result<Self::Value> {
-                if let Some((b"a", v)) = dict.next_entry()? {
-                    let a = v;
-                    if let Some((b"b", v)) = dict.next_entry()? {
-                        let b = v;
-                        return Ok(Foo { a, b });
+            fn visit_dict<A>(self, mut dict: A) -> Result<Self::Value>
+            where
+                A: Dict<'buf>,
+            {
+                if let Some((b"a", id)) = dict.next_entry()? {
+                    if let Some((b"b", b)) = dict.next_entry()? {
+                        return Ok(Foo { id, b });
                     }
                 }
                 Err(Error::Eof)
